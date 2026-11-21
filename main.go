@@ -5,6 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // oidNames maps dotted OIDs to their conventional names.
@@ -201,46 +204,142 @@ func asn1TagName(tag int) string {
 	}
 }
 
+// tagName returns the display name of a tag, taking its class into account.
+func tagName(class, tag int) string {
+	switch class {
+	case asn1.ClassUniversal:
+		return asn1TagName(tag)
+	case asn1.ClassApplication:
+		return fmt.Sprintf("[APPLICATION %d]", tag)
+	case asn1.ClassContextSpecific:
+		return fmt.Sprintf("[%d]", tag)
+	default:
+		return fmt.Sprintf("[PRIVATE %d]", tag)
+	}
+}
+
+// parseASN1 appends every TLV in data to result. Errors from nested values
+// are returned, so a failed parse can be detected and discarded by the caller.
 func parseASN1(data []byte, indent string, result *string) error {
-	var value asn1.RawValue
-	rest, err := asn1.Unmarshal(data, &value)
-	if err != nil {
-		fmt.Println("Error parsing ASN.1 data:", err)
-		return err
+	for len(data) > 0 {
+		var value asn1.RawValue
+		rest, err := asn1.Unmarshal(data, &value)
+		if err != nil {
+			return err
+		}
+		if err := formatValue(value, indent, result); err != nil {
+			return err
+		}
+		data = rest
+	}
+	return nil
+}
+
+// parseNested parses data as embedded DER. It reports false unless all of
+// data parses, so a failed attempt leaves no partial output behind.
+func parseNested(data []byte, indent string) (string, bool) {
+	if len(data) == 0 {
+		return "", false
+	}
+	var out string
+	if err := parseASN1(data, indent, &out); err != nil {
+		return "", false
+	}
+	return out, true
+}
+
+func formatValue(value asn1.RawValue, indent string, result *string) error {
+	name := tagName(value.Class, value.Tag)
+	if value.IsCompound {
+		*result += fmt.Sprintf("%s%s\n", indent, name)
+		return parseASN1(value.Bytes, indent+"  ", result)
+	}
+	if value.Class != asn1.ClassUniversal {
+		*result += fmt.Sprintf("%s%s: %x\n", indent, name, value.Bytes)
+		return nil
 	}
 
-	if value.IsCompound {
-		*result += fmt.Sprintf("%s%s, Class: %d\n", indent, asn1TagName(value.Tag), value.Class)
-		parseASN1(value.Bytes, indent+"  ", result)
-	} else {
-		switch value.Tag {
-		case asn1.TagOctetString:
-			err = parseASN1(value.Bytes, indent+"  ", result)
-			if err != nil {
-				//*result += fmt.Sprintf("%sValue: %x\n", indent, value.Bytes)
-				*result += fmt.Sprintf("%s%s: %x\n", indent, asn1TagName(value.Tag), value.Bytes)
+	switch value.Tag {
+	case asn1.TagOctetString:
+		if nested, ok := parseNested(value.Bytes, indent+"  "); ok {
+			*result += fmt.Sprintf("%s%s\n%s", indent, name, nested)
+		} else {
+			*result += fmt.Sprintf("%s%s: %x\n", indent, name, value.Bytes)
+		}
+	case asn1.TagBitString:
+		var bits asn1.BitString
+		if _, err := asn1.Unmarshal(value.FullBytes, &bits); err != nil {
+			return fmt.Errorf("decoding BIT STRING: %w", err)
+		}
+		unused := len(bits.Bytes)*8 - bits.BitLength
+		if unused == 0 {
+			if nested, ok := parseNested(bits.Bytes, indent+"  "); ok {
+				*result += fmt.Sprintf("%s%s (0 unused bits)\n%s", indent, name, nested)
+				return nil
 			}
-		case asn1.TagOID:
-			var oid asn1.ObjectIdentifier
-			rest, err := asn1.Unmarshal(value.FullBytes, &oid)
-			if err != nil || len(rest) > 0 {
-				fmt.Printf("Error decoding OID")
-			}
-			*result += fmt.Sprintf("%s%s: %s\n", indent, asn1TagName(value.Tag), getOIDName(oid.String()))
-		case asn1.TagNull:
-			*result += fmt.Sprintf("%s%s\n", indent, asn1TagName(value.Tag))
-		case asn1.TagPrintableString:
-			*result += fmt.Sprintf("%s%s: %s\n", indent, asn1TagName(value.Tag), string(value.Bytes))
-		default:
-			*result += fmt.Sprintf("%s%s: %x\n", indent, asn1TagName(value.Tag), value.Bytes)
+		}
+		*result += fmt.Sprintf("%s%s (%d unused bits): %x\n", indent, name, unused, bits.Bytes)
+	case asn1.TagOID:
+		var oid asn1.ObjectIdentifier
+		rest, err := asn1.Unmarshal(value.FullBytes, &oid)
+		if err != nil || len(rest) > 0 {
+			fmt.Printf("Error decoding OID")
+		}
+		*result += fmt.Sprintf("%s%s: %s\n", indent, name, getOIDName(oid.String()))
+	case asn1.TagNull:
+		*result += fmt.Sprintf("%s%s\n", indent, name)
+	case asn1.TagUTCTime, asn1.TagGeneralizedTime:
+		var t time.Time
+		if _, err := asn1.Unmarshal(value.FullBytes, &t); err != nil {
+			*result += fmt.Sprintf("%s%s: %s\n", indent, name, printable(value.Bytes))
+		} else {
+			*result += fmt.Sprintf("%s%s: %s (%s)\n", indent, name, value.Bytes, t.UTC().Format(time.RFC3339))
+		}
+	case asn1.TagUTF8String, asn1.TagNumericString, asn1.TagPrintableString, asn1.TagT61String,
+		asn1.TagIA5String, 21 /* VideotexString */, 25 /* GraphicString */, 26 /* VisibleString */, asn1.TagGeneralString:
+		*result += fmt.Sprintf("%s%s: %s\n", indent, name, printable(value.Bytes))
+	case asn1.TagBMPString:
+		*result += fmt.Sprintf("%s%s: %s\n", indent, name, decodeUCS(value.Bytes, 2))
+	case 28: // UniversalString
+		*result += fmt.Sprintf("%s%s: %s\n", indent, name, decodeUCS(value.Bytes, 4))
+	default:
+		*result += fmt.Sprintf("%s%s: %x\n", indent, name, value.Bytes)
+	}
+	return nil
+}
+
+// printable returns b as text if it is valid, printable UTF-8, and as hex otherwise.
+func printable(b []byte) string {
+	s := string(b)
+	if !utf8.ValidString(s) {
+		return fmt.Sprintf("%x", b)
+	}
+	for _, r := range s {
+		if !unicode.IsPrint(r) {
+			return fmt.Sprintf("%x", b)
 		}
 	}
+	return s
+}
 
-	if len(rest) > 0 {
-		parseASN1(rest, indent, result)
+// decodeUCS decodes big-endian UCS-2 (BMPString, width 2) or UCS-4
+// (UniversalString, width 4) text, falling back to hex if b is malformed.
+func decodeUCS(b []byte, width int) string {
+	if len(b)%width != 0 {
+		return fmt.Sprintf("%x", b)
 	}
-
-	return nil
+	var s []byte
+	for i := 0; i < len(b); i += width {
+		var r rune
+		for _, c := range b[i : i+width] {
+			r = r<<8 | rune(c)
+		}
+		if !utf8.ValidRune(r) {
+			return fmt.Sprintf("%x", b)
+		}
+		s = utf8.AppendRune(s, r)
+	}
+	return printable(s)
 }
 
 func parseDER(filePath string, result *string) {
