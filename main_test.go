@@ -113,7 +113,10 @@ func TestParseASN1(t *testing.T) {
 		want    string
 		wantErr bool
 	}{
-		{"context primitive", "86026162", "[6]: 6162\n", false},
+		{"context primitive printable", "86026162", "[6]: \"ab\"\n", false},
+		{"context primitive printable quotes", "860322615c", "[6]: \"\\\"a\\\\\"\n", false},
+		{"context primitive binary", "80020aff", "[0]: 0aff\n", false},
+		{"context primitive empty", "8000", "[0]: \n", false},
 		{"context constructed", "a003020102", "[0]\n  INTEGER: 02\n", false},
 		{"application tag", "4100", "[APPLICATION 1]: \n", false},
 		{"octet string with nested DER", "0403020105", "OCTET STRING\n  INTEGER: 05\n", false},

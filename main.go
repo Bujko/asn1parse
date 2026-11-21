@@ -259,7 +259,14 @@ func formatValue(value asn1.RawValue, indent string, result *string) error {
 		return parseASN1(value.Bytes, indent+"  ", result)
 	}
 	if value.Class != asn1.ClassUniversal {
-		*result += fmt.Sprintf("%s%s: %x\n", indent, name, value.Bytes)
+		// The type of an implicitly tagged value is unknown without a schema.
+		// Show printable ASCII (e.g. SAN dNSName, URIs) as quoted text so it
+		// cannot be mistaken for hex.
+		if isPrintableASCII(value.Bytes) {
+			*result += fmt.Sprintf("%s%s: %q\n", indent, name, value.Bytes)
+		} else {
+			*result += fmt.Sprintf("%s%s: %x\n", indent, name, value.Bytes)
+		}
 		return nil
 	}
 
@@ -324,6 +331,20 @@ func printable(b []byte) string {
 		}
 	}
 	return s
+}
+
+// isPrintableASCII reports whether b is non-empty and only holds printable
+// ASCII characters (space through tilde).
+func isPrintableASCII(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	for _, c := range b {
+		if c < ' ' || c > '~' {
+			return false
+		}
+	}
+	return true
 }
 
 // decodeUCS decodes big-endian UCS-2 (BMPString, width 2) or UCS-4
