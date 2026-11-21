@@ -11,7 +11,7 @@ Language-wide conventions: ../AGENTS.md. Rules in this file take precedence.
 - Lint: `go vet ./...` (`golangci-lint run` if installed; not installed yet)
 - Build: `go build ./...`
 - Test: `go test ./...`
-- Run: `go run . [-inform DER] <file>` (e.g. `go run . testdata/google-com.der`)
+- Run: `go run . [-inform DER|PEM] [file]` (reads stdin if file is omitted or `-`; e.g. `go run . -inform PEM testdata/google-com.pem`)
 
 ## Structure
 - `main.go` – everything: OID name table, tag names, recursive parser, CLI.

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/hex"
 	"errors"
 	"os"
@@ -9,17 +10,47 @@ import (
 	"testing"
 )
 
-func TestParseDER(t *testing.T) {
-	got, err := parseDER("testdata/google-com.der")
+func TestRun(t *testing.T) {
+	derData, err := os.ReadFile("testdata/google-com.der")
 	if err != nil {
-		t.Fatalf("parseDER: %v", err)
+		t.Fatal(err)
 	}
-	if !strings.Contains(got, "OBJECT IDENTIFIER: sha256WithRSAEncryption") {
-		t.Errorf("output lacks the signature algorithm:\n%s", got)
+	pemData, err := os.ReadFile("testdata/google-com.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := run("testdata/google-com.der", formatDER, nil)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !strings.Contains(want, "OBJECT IDENTIFIER: sha256WithRSAEncryption") {
+		t.Errorf("output lacks the signature algorithm:\n%s", want)
+	}
+
+	tests := []struct {
+		name   string
+		path   string
+		format inputFormat
+		stdin  []byte
+	}{
+		{"PEM file", "testdata/google-com.pem", formatPEM, nil},
+		{"DER on stdin", "-", formatDER, derData},
+		{"PEM on stdin", "-", formatPEM, pemData},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := run(tt.path, tt.format, bytes.NewReader(tt.stdin))
+			if err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			if got != want {
+				t.Errorf("output differs from the DER file output")
+			}
+		})
 	}
 }
 
-func TestParseDERErrors(t *testing.T) {
+func TestRunErrors(t *testing.T) {
 	dir := t.TempDir()
 	truncated := filepath.Join(dir, "truncated.der")
 	if err := os.WriteFile(truncated, []byte{0x30, 0x05, 0x02, 0x01}, 0o600); err != nil {
@@ -29,15 +60,18 @@ func TestParseDERErrors(t *testing.T) {
 	tests := []struct {
 		name   string
 		path   string
+		format inputFormat
 		wantIs error
 		prefix string
 	}{
-		{"missing file", filepath.Join(dir, "missing.der"), os.ErrNotExist, "reading file: "},
-		{"truncated DER", truncated, nil, "parsing ASN.1 data: "},
+		{"missing file", filepath.Join(dir, "missing.der"), formatDER, os.ErrNotExist, "reading input: "},
+		{"truncated DER", truncated, formatDER, nil, "parsing ASN.1 data: "},
+		{"DER read as PEM", "testdata/google-com.der", formatPEM, nil, "decoding PEM: "},
+		{"PEM read as DER", "testdata/google-com.pem", formatDER, nil, "parsing ASN.1 data: "},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := parseDER(tt.path)
+			_, err := run(tt.path, tt.format, nil)
 			if err == nil {
 				t.Fatal("expected an error")
 			}
@@ -48,6 +82,27 @@ func TestParseDERErrors(t *testing.T) {
 				t.Errorf("errors.Is(%v, %v) = false", err, tt.wantIs)
 			}
 		})
+	}
+}
+
+func TestParseFormat(t *testing.T) {
+	tests := []struct {
+		in      string
+		want    inputFormat
+		wantErr bool
+	}{
+		{"DER", formatDER, false},
+		{"der", formatDER, false},
+		{"PEM", formatPEM, false},
+		{"pem", formatPEM, false},
+		{"XYZ", 0, true},
+		{"", 0, true},
+	}
+	for _, tt := range tests {
+		got, err := parseFormat(tt.in)
+		if (err != nil) != tt.wantErr || got != tt.want {
+			t.Errorf("parseFormat(%q) = %v, %v; want %v, wantErr %v", tt.in, got, err, tt.want, tt.wantErr)
+		}
 	}
 }
 

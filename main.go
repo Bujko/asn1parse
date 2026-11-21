@@ -2,9 +2,13 @@ package main
 
 import (
 	"encoding/asn1"
+	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -342,44 +346,92 @@ func decodeUCS(b []byte, width int) string {
 	return printable(s)
 }
 
-func parseDER(filePath string) (string, error) {
-	data, err := os.ReadFile(filePath)
+type inputFormat int
+
+const (
+	formatDER inputFormat = iota
+	formatPEM
+)
+
+// parseFormat parses the -inform flag value, case-insensitively like openssl.
+func parseFormat(s string) (inputFormat, error) {
+	switch strings.ToUpper(s) {
+	case "DER":
+		return formatDER, nil
+	case "PEM":
+		return formatPEM, nil
+	default:
+		return 0, fmt.Errorf("invalid format %q: please use 'DER' or 'PEM'", s)
+	}
+}
+
+// readInput returns the contents of path, or of stdin if path is "-".
+func readInput(path string, stdin io.Reader) ([]byte, error) {
+	if path == "-" {
+		return io.ReadAll(stdin)
+	}
+	return os.ReadFile(path)
+}
+
+// toDER returns the DER bytes of data. For PEM input it uses the first PEM
+// block, like openssl asn1parse.
+func toDER(data []byte, format inputFormat) ([]byte, error) {
+	if format == formatDER {
+		return data, nil
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, errors.New("decoding PEM: no PEM block found")
+	}
+	return block.Bytes, nil
+}
+
+// run reads, decodes and parses the input at path ("-" for stdin) and
+// returns the formatted output.
+func run(path string, format inputFormat, stdin io.Reader) (string, error) {
+	data, err := readInput(path, stdin)
 	if err != nil {
-		return "", fmt.Errorf("reading file: %w", err)
+		return "", fmt.Errorf("reading input: %w", err)
+	}
+	der, err := toDER(data, format)
+	if err != nil {
+		return "", err
 	}
 
 	var result string
-	if err := parseASN1(data, "", &result); err != nil {
+	if err := parseASN1(der, "", &result); err != nil {
 		return "", fmt.Errorf("parsing ASN.1 data: %w", err)
 	}
 	return result, nil
 }
 
 func main() {
-
-	var result string
-	var err error
-	// Define a string flag with a default value and a usage description
-	format := flag.String("inform", "DER", "a name to greet")
-
+	flag.Usage = func() {
+		out := flag.CommandLine.Output()
+		fmt.Fprintln(out, "Usage: asn1parse [-inform DER|PEM] [file]")
+		fmt.Fprintln(out, "\nDecodes ASN.1 and prints its structure. Reads stdin if file is omitted or \"-\".")
+		fmt.Fprintln(out)
+		flag.PrintDefaults()
+	}
+	inform := flag.String("inform", "DER", "input format: DER or PEM")
 	flag.Parse()
 
-	filepath := flag.Args()
-
-	if len(filepath) != 1 {
-		fmt.Fprintln(os.Stderr, "Please provide exactly one file path as an argument.")
-		os.Exit(1)
+	path := "-"
+	switch flag.NArg() {
+	case 0:
+	case 1:
+		path = flag.Arg(0)
+	default:
+		flag.Usage()
+		os.Exit(2)
+	}
+	format, err := parseFormat(*inform)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		os.Exit(2)
 	}
 
-	if *format == "DER" {
-		result, err = parseDER(filepath[0])
-	} else if *format == "PEM" {
-		// Process the file in PEM format
-		fmt.Printf("Processing file %s in PEM format...\n", filepath[0])
-		// Add your PEM processing logic here
-	} else {
-		err = fmt.Errorf("invalid format %q: please use 'DER' or 'PEM'", *format)
-	}
+	result, err := run(path, format, os.Stdin)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
@@ -387,5 +439,4 @@ func main() {
 
 	fmt.Println("ASN.1 Parsed Output:")
 	fmt.Println(result)
-
 }
