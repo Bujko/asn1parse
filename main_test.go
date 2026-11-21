@@ -19,7 +19,7 @@ func TestRun(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := run("testdata/google-com.der", formatDER, nil)
+	want, err := run("testdata/google-com.der", formatDER, options{}, nil)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -39,7 +39,7 @@ func TestRun(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := run(tt.path, tt.format, bytes.NewReader(tt.stdin))
+			got, err := run(tt.path, tt.format, options{}, bytes.NewReader(tt.stdin))
 			if err != nil {
 				t.Fatalf("run: %v", err)
 			}
@@ -71,7 +71,7 @@ func TestRunErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := run(tt.path, tt.format, nil)
+			_, err := run(tt.path, tt.format, options{}, nil)
 			if err == nil {
 				t.Fatal("expected an error")
 			}
@@ -144,7 +144,7 @@ func TestParseASN1(t *testing.T) {
 				t.Fatal(err)
 			}
 			var got string
-			err = parseASN1(der, "", &got)
+			err = parseASN1(der, 0, 0, options{}, &got)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -177,5 +177,26 @@ func TestGetOIDName(t *testing.T) {
 		if got := getOIDName(tt.oid); got != tt.want {
 			t.Errorf("getOIDName(%q) = %q, want %q", tt.oid, got, tt.want)
 		}
+	}
+}
+
+func TestParseASN1Offsets(t *testing.T) {
+	// SEQUENCE { OCTET STRING { INTEGER 5 }, BIT STRING { INTEGER 5 } }
+	der, err := hex.DecodeString("300b0403020105030400020105")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "" +
+		"    0:d=0  hl=2 l=  11 SEQUENCE\n" +
+		"    2:d=1  hl=2 l=   3   OCTET STRING\n" +
+		"    4:d=2  hl=2 l=   1     INTEGER: 05\n" +
+		"    7:d=1  hl=2 l=   4   BIT STRING (0 unused bits)\n" +
+		"   10:d=2  hl=2 l=   1     INTEGER: 05\n" // after the unused-bits byte
+	var got string
+	if err := parseASN1(der, 0, 0, options{offsets: true}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
 	}
 }
