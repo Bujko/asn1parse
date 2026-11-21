@@ -2,8 +2,54 @@ package main
 
 import (
 	"encoding/hex"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestParseDER(t *testing.T) {
+	got, err := parseDER("testdata/google-com.der")
+	if err != nil {
+		t.Fatalf("parseDER: %v", err)
+	}
+	if !strings.Contains(got, "OBJECT IDENTIFIER: sha256WithRSAEncryption") {
+		t.Errorf("output lacks the signature algorithm:\n%s", got)
+	}
+}
+
+func TestParseDERErrors(t *testing.T) {
+	dir := t.TempDir()
+	truncated := filepath.Join(dir, "truncated.der")
+	if err := os.WriteFile(truncated, []byte{0x30, 0x05, 0x02, 0x01}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name   string
+		path   string
+		wantIs error
+		prefix string
+	}{
+		{"missing file", filepath.Join(dir, "missing.der"), os.ErrNotExist, "reading file: "},
+		{"truncated DER", truncated, nil, "parsing ASN.1 data: "},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := parseDER(tt.path)
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			if !strings.HasPrefix(err.Error(), tt.prefix) {
+				t.Errorf("error %q lacks prefix %q", err, tt.prefix)
+			}
+			if tt.wantIs != nil && !errors.Is(err, tt.wantIs) {
+				t.Errorf("errors.Is(%v, %v) = false", err, tt.wantIs)
+			}
+		})
+	}
+}
 
 func TestParseASN1(t *testing.T) {
 	tests := []struct {
@@ -29,6 +75,9 @@ func TestParseASN1(t *testing.T) {
 		{"sibling values", "020101020102", "INTEGER: 01\nINTEGER: 02\n", false},
 		{"truncated sibling", "0201010500ff", "", true},
 		{"truncated sequence", "30050201", "", true},
+		{"OID", "06032a0304", "OBJECT IDENTIFIER: 1.2.3.4\n", false},
+		{"empty OID", "0600", "", true},
+		{"invalid OID inside octet string falls back to hex", "04020600", "OCTET STRING: 0600\n", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

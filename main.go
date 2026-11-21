@@ -281,9 +281,9 @@ func formatValue(value asn1.RawValue, indent string, result *string) error {
 		*result += fmt.Sprintf("%s%s (%d unused bits): %x\n", indent, name, unused, bits.Bytes)
 	case asn1.TagOID:
 		var oid asn1.ObjectIdentifier
-		rest, err := asn1.Unmarshal(value.FullBytes, &oid)
-		if err != nil || len(rest) > 0 {
-			fmt.Printf("Error decoding OID")
+		// FullBytes holds exactly one TLV, so there is never trailing data.
+		if _, err := asn1.Unmarshal(value.FullBytes, &oid); err != nil {
+			return fmt.Errorf("decoding OBJECT IDENTIFIER: %w", err)
 		}
 		*result += fmt.Sprintf("%s%s: %s\n", indent, name, getOIDName(oid.String()))
 	case asn1.TagNull:
@@ -342,23 +342,23 @@ func decodeUCS(b []byte, width int) string {
 	return printable(s)
 }
 
-func parseDER(filePath string, result *string) {
+func parseDER(filePath string) (string, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		fmt.Println("Error reading file:", err)
-		os.Exit(1)
+		return "", fmt.Errorf("reading file: %w", err)
 	}
 
-	err = parseASN1(data, "", result)
-	if err != nil {
-		fmt.Println("Error parsing ASN.1 data:", err)
-		os.Exit(1)
+	var result string
+	if err := parseASN1(data, "", &result); err != nil {
+		return "", fmt.Errorf("parsing ASN.1 data: %w", err)
 	}
+	return result, nil
 }
 
 func main() {
 
 	var result string
+	var err error
 	// Define a string flag with a default value and a usage description
 	format := flag.String("inform", "DER", "a name to greet")
 
@@ -367,18 +367,21 @@ func main() {
 	filepath := flag.Args()
 
 	if len(filepath) != 1 {
-		fmt.Println("Please provide exactly one file path as an argument.")
+		fmt.Fprintln(os.Stderr, "Please provide exactly one file path as an argument.")
 		os.Exit(1)
 	}
 
 	if *format == "DER" {
-		parseDER(filepath[0], &result)
+		result, err = parseDER(filepath[0])
 	} else if *format == "PEM" {
 		// Process the file in PEM format
 		fmt.Printf("Processing file %s in PEM format...\n", filepath[0])
 		// Add your PEM processing logic here
 	} else {
-		fmt.Println("Invalid format. Please use 'DER' or 'PEM'.")
+		err = fmt.Errorf("invalid format %q: please use 'DER' or 'PEM'", *format)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
 
