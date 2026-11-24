@@ -2,9 +2,13 @@ package main
 
 import (
 	"encoding/asn1"
+	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -218,18 +222,26 @@ func tagName(class, tag int) string {
 	}
 }
 
-// parseASN1 appends every TLV in data to result. Errors from nested values
-// are returned, so a failed parse can be detected and discarded by the caller.
-func parseASN1(data []byte, indent string, result *string) error {
+// options controls how values are printed.
+type options struct {
+	offsets bool // prefix each line with offset, depth, header length and length
+}
+
+// parseASN1 appends every TLV in data to result. offset is the position of
+// data in the whole input and depth its nesting level. Errors from nested
+// values are returned, so a failed parse can be detected and discarded by
+// the caller.
+func parseASN1(data []byte, offset, depth int, opts options, result *string) error {
 	for len(data) > 0 {
 		var value asn1.RawValue
 		rest, err := asn1.Unmarshal(data, &value)
 		if err != nil {
 			return err
 		}
-		if err := formatValue(value, indent, result); err != nil {
+		if err := formatValue(value, offset, depth, opts, result); err != nil {
 			return err
 		}
+		offset += len(data) - len(rest)
 		data = rest
 	}
 	return nil
@@ -237,34 +249,45 @@ func parseASN1(data []byte, indent string, result *string) error {
 
 // parseNested parses data as embedded DER. It reports false unless all of
 // data parses, so a failed attempt leaves no partial output behind.
-func parseNested(data []byte, indent string) (string, bool) {
+func parseNested(data []byte, offset, depth int, opts options) (string, bool) {
 	if len(data) == 0 {
 		return "", false
 	}
 	var out string
-	if err := parseASN1(data, indent, &out); err != nil {
+	if err := parseASN1(data, offset, depth, opts, &out); err != nil {
 		return "", false
 	}
 	return out, true
 }
 
-func formatValue(value asn1.RawValue, indent string, result *string) error {
-	name := tagName(value.Class, value.Tag)
+func formatValue(value asn1.RawValue, offset, depth int, opts options, result *string) error {
+	hl := len(value.FullBytes) - len(value.Bytes)
+	line := strings.Repeat("  ", depth) + tagName(value.Class, value.Tag)
+	if opts.offsets {
+		line = fmt.Sprintf("%5d:d=%-2d hl=%d l=%4d ", offset, depth, hl, len(value.Bytes)) + line
+	}
 	if value.IsCompound {
-		*result += fmt.Sprintf("%s%s\n", indent, name)
-		return parseASN1(value.Bytes, indent+"  ", result)
+		*result += fmt.Sprintf("%s\n", line)
+		return parseASN1(value.Bytes, offset+hl, depth+1, opts, result)
 	}
 	if value.Class != asn1.ClassUniversal {
-		*result += fmt.Sprintf("%s%s: %x\n", indent, name, value.Bytes)
+		// The type of an implicitly tagged value is unknown without a schema.
+		// Show printable ASCII (e.g. SAN dNSName, URIs) as quoted text so it
+		// cannot be mistaken for hex.
+		if isPrintableASCII(value.Bytes) {
+			*result += fmt.Sprintf("%s: %q\n", line, value.Bytes)
+		} else {
+			*result += fmt.Sprintf("%s: %x\n", line, value.Bytes)
+		}
 		return nil
 	}
 
 	switch value.Tag {
 	case asn1.TagOctetString:
-		if nested, ok := parseNested(value.Bytes, indent+"  "); ok {
-			*result += fmt.Sprintf("%s%s\n%s", indent, name, nested)
+		if nested, ok := parseNested(value.Bytes, offset+hl, depth+1, opts); ok {
+			*result += fmt.Sprintf("%s\n%s", line, nested)
 		} else {
-			*result += fmt.Sprintf("%s%s: %x\n", indent, name, value.Bytes)
+			*result += fmt.Sprintf("%s: %x\n", line, value.Bytes)
 		}
 	case asn1.TagBitString:
 		var bits asn1.BitString
@@ -273,37 +296,37 @@ func formatValue(value asn1.RawValue, indent string, result *string) error {
 		}
 		unused := len(bits.Bytes)*8 - bits.BitLength
 		if unused == 0 {
-			if nested, ok := parseNested(bits.Bytes, indent+"  "); ok {
-				*result += fmt.Sprintf("%s%s (0 unused bits)\n%s", indent, name, nested)
+			if nested, ok := parseNested(bits.Bytes, offset+hl+1, depth+1, opts); ok {
+				*result += fmt.Sprintf("%s (0 unused bits)\n%s", line, nested)
 				return nil
 			}
 		}
-		*result += fmt.Sprintf("%s%s (%d unused bits): %x\n", indent, name, unused, bits.Bytes)
+		*result += fmt.Sprintf("%s (%d unused bits): %x\n", line, unused, bits.Bytes)
 	case asn1.TagOID:
 		var oid asn1.ObjectIdentifier
-		rest, err := asn1.Unmarshal(value.FullBytes, &oid)
-		if err != nil || len(rest) > 0 {
-			fmt.Printf("Error decoding OID")
+		// FullBytes holds exactly one TLV, so there is never trailing data.
+		if _, err := asn1.Unmarshal(value.FullBytes, &oid); err != nil {
+			return fmt.Errorf("decoding OBJECT IDENTIFIER: %w", err)
 		}
-		*result += fmt.Sprintf("%s%s: %s\n", indent, name, getOIDName(oid.String()))
+		*result += fmt.Sprintf("%s: %s\n", line, getOIDName(oid.String()))
 	case asn1.TagNull:
-		*result += fmt.Sprintf("%s%s\n", indent, name)
+		*result += fmt.Sprintf("%s\n", line)
 	case asn1.TagUTCTime, asn1.TagGeneralizedTime:
 		var t time.Time
 		if _, err := asn1.Unmarshal(value.FullBytes, &t); err != nil {
-			*result += fmt.Sprintf("%s%s: %s\n", indent, name, printable(value.Bytes))
+			*result += fmt.Sprintf("%s: %s\n", line, printable(value.Bytes))
 		} else {
-			*result += fmt.Sprintf("%s%s: %s (%s)\n", indent, name, value.Bytes, t.UTC().Format(time.RFC3339))
+			*result += fmt.Sprintf("%s: %s (%s)\n", line, value.Bytes, t.UTC().Format(time.RFC3339))
 		}
 	case asn1.TagUTF8String, asn1.TagNumericString, asn1.TagPrintableString, asn1.TagT61String,
 		asn1.TagIA5String, 21 /* VideotexString */, 25 /* GraphicString */, 26 /* VisibleString */, asn1.TagGeneralString:
-		*result += fmt.Sprintf("%s%s: %s\n", indent, name, printable(value.Bytes))
+		*result += fmt.Sprintf("%s: %s\n", line, printable(value.Bytes))
 	case asn1.TagBMPString:
-		*result += fmt.Sprintf("%s%s: %s\n", indent, name, decodeUCS(value.Bytes, 2))
+		*result += fmt.Sprintf("%s: %s\n", line, decodeUCS(value.Bytes, 2))
 	case 28: // UniversalString
-		*result += fmt.Sprintf("%s%s: %s\n", indent, name, decodeUCS(value.Bytes, 4))
+		*result += fmt.Sprintf("%s: %s\n", line, decodeUCS(value.Bytes, 4))
 	default:
-		*result += fmt.Sprintf("%s%s: %x\n", indent, name, value.Bytes)
+		*result += fmt.Sprintf("%s: %x\n", line, value.Bytes)
 	}
 	return nil
 }
@@ -320,6 +343,20 @@ func printable(b []byte) string {
 		}
 	}
 	return s
+}
+
+// isPrintableASCII reports whether b is non-empty and only holds printable
+// ASCII characters (space through tilde).
+func isPrintableASCII(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	for _, c := range b {
+		if c < ' ' || c > '~' {
+			return false
+		}
+	}
+	return true
 }
 
 // decodeUCS decodes big-endian UCS-2 (BMPString, width 2) or UCS-4
@@ -342,47 +379,98 @@ func decodeUCS(b []byte, width int) string {
 	return printable(s)
 }
 
-func parseDER(filePath string, result *string) {
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		fmt.Println("Error reading file:", err)
-		os.Exit(1)
-	}
+type inputFormat int
 
-	err = parseASN1(data, "", result)
-	if err != nil {
-		fmt.Println("Error parsing ASN.1 data:", err)
-		os.Exit(1)
+const (
+	formatDER inputFormat = iota
+	formatPEM
+)
+
+// parseFormat parses the -inform flag value, case-insensitively like openssl.
+func parseFormat(s string) (inputFormat, error) {
+	switch strings.ToUpper(s) {
+	case "DER":
+		return formatDER, nil
+	case "PEM":
+		return formatPEM, nil
+	default:
+		return 0, fmt.Errorf("invalid format %q: please use 'DER' or 'PEM'", s)
 	}
 }
 
-func main() {
+// readInput returns the contents of path, or of stdin if path is "-".
+func readInput(path string, stdin io.Reader) ([]byte, error) {
+	if path == "-" {
+		return io.ReadAll(stdin)
+	}
+	return os.ReadFile(path)
+}
 
-	var result string
-	// Define a string flag with a default value and a usage description
-	format := flag.String("inform", "DER", "a name to greet")
+// toDER returns the DER bytes of data. For PEM input it uses the first PEM
+// block, like openssl asn1parse.
+func toDER(data []byte, format inputFormat) ([]byte, error) {
+	if format == formatDER {
+		return data, nil
+	}
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, errors.New("decoding PEM: no PEM block found")
+	}
+	return block.Bytes, nil
+}
 
-	flag.Parse()
-
-	filepath := flag.Args()
-
-	if len(filepath) != 1 {
-		fmt.Println("Please provide exactly one file path as an argument.")
-		os.Exit(1)
+// run reads, decodes and parses the input at path ("-" for stdin) and
+// returns the formatted output.
+func run(path string, format inputFormat, opts options, stdin io.Reader) (string, error) {
+	data, err := readInput(path, stdin)
+	if err != nil {
+		return "", fmt.Errorf("reading input: %w", err)
+	}
+	der, err := toDER(data, format)
+	if err != nil {
+		return "", err
 	}
 
-	if *format == "DER" {
-		parseDER(filepath[0], &result)
-	} else if *format == "PEM" {
-		// Process the file in PEM format
-		fmt.Printf("Processing file %s in PEM format...\n", filepath[0])
-		// Add your PEM processing logic here
-	} else {
-		fmt.Println("Invalid format. Please use 'DER' or 'PEM'.")
+	var result string
+	if err := parseASN1(der, 0, 0, opts, &result); err != nil {
+		return "", fmt.Errorf("parsing ASN.1 data: %w", err)
+	}
+	return result, nil
+}
+
+func main() {
+	flag.Usage = func() {
+		out := flag.CommandLine.Output()
+		fmt.Fprintln(out, "Usage: asn1parse [-inform DER|PEM] [-offsets] [file]")
+		fmt.Fprintln(out, "\nDecodes ASN.1 and prints its structure. Reads stdin if file is omitted or \"-\".")
+		fmt.Fprintln(out)
+		flag.PrintDefaults()
+	}
+	inform := flag.String("inform", "DER", "input format: DER or PEM")
+	offsets := flag.Bool("offsets", false, "prefix each line with offset, depth, header length and length, like openssl asn1parse")
+	flag.Parse()
+
+	path := "-"
+	switch flag.NArg() {
+	case 0:
+	case 1:
+		path = flag.Arg(0)
+	default:
+		flag.Usage()
+		os.Exit(2)
+	}
+	format, err := parseFormat(*inform)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		os.Exit(2)
+	}
+
+	result, err := run(path, format, options{offsets: *offsets}, os.Stdin)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
 
 	fmt.Println("ASN.1 Parsed Output:")
 	fmt.Println(result)
-
 }
